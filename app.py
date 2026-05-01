@@ -1,34 +1,22 @@
+# ==========================================
+# LOCAL CLIENT: BATCH SENDER & FPS CONTROL
+# ==========================================
 import cv2
 import time
 import requests
 
-# ==========================================
-# 1. SETUP
-# ==========================================
-# ⚠️ REPLACE this with the URL printed in your Colab console!
-COLAB_API_URL = "https://detection-vertebrae-punctual.ngrok-free.dev/analyze"
+COLAB_API_URL = "https://detection-vertebrae-punctual.ngrok-free.dev/analyze_batch"
 
-# Telegram Bot Setup (Handled locally to ensure instant alerting)
-TELEGRAM_TOKEN = "7985477518:AAGu85pNa2DAEbxNTEIrhXR6c05__A5vm2g"
-CHAT_ID = "8062403854"
+# --- CONFIGURATION ---
+FPS_LIMIT = 20.0  # How many batches to process per second
+FRAME_DELAY = 1.0 / FPS_LIMIT
+CONF_THRESHOLD = 0.50
 
-def send_telegram_alert(message, location):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    text = f"🔴 RED ALERT\n📍 {location}\n📄 {message}"
-    try:
-        requests.post(url, data={"chat_id": CHAT_ID, "text": text}, timeout=5)
-    except Exception as e:
-        print(f"Failed to send Telegram alert: {e}")
-
-# ==========================================
-# 2. INITIALIZE CAMERAS
-# ==========================================
-print("Initializing cameras...")
-# Update indices (0, 1, 2) based on how Windows/Mac mounts your USB cameras
+# --- INITIALIZE CAMERAS ---
 camera_sources = {
-    "Built-in WebCam": 0,
-    # "USB Cam Left": 1,
-    # "USB Cam Right": 2
+    "Built-in": 0, 
+    # "USB_Left": 1, 
+    # "USB_Right": 2
 }
 
 cameras = {}
@@ -36,78 +24,94 @@ for name, source in camera_sources.items():
     cap = cv2.VideoCapture(source)
     if cap.isOpened():
         cameras[name] = cap
-        print(f"✅ Connected to: {name}")
-    else:
-        print(f"⚠️ Failed to connect: {name}")
+        print(f"✅ Connected: {name}")
 
 if not cameras:
     print("❌ No cameras found. Exiting.")
     exit()
 
-# ==========================================
-# 3. MAIN SURVEILLANCE LOOP
-# ==========================================
 last_alert_time = {}
-conf_threshold = 0.50
 
+print(f"\n📡 Transmitting batches at {FPS_LIMIT} FPS...")
 try:
-    print(f"\n📡 Transmitting video to Colab Server: {COLAB_API_URL}")
-    print("Press 'q' in any video window to quit.\n")
-    
     while True:
+        loop_start_time = time.time()
+        
+        batch_files = []
+        batch_names = []
+        
+        # 1. Gather a frame from every camera
         for cam_name, cap in cameras.items():
             ret, frame = cap.read()
             if not ret:
                 continue
 
-            # Display the camera feed locally
             cv2.imshow(cam_name, frame)
-
-            # Compress the frame to JPEG to send it over the internet super fast
+            
+            # Compress to JPEG
             _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
             
-            # Send the compressed image to Colab Brain
+            # Append to batch arrays
+            # 'images' must match the FastAPI parameter name exactly
+            batch_files.append(('images', (f"{cam_name}.jpg", buffer.tobytes(), 'image/jpeg')))
+            batch_names.append(('camera_names', cam_name))
+
+        # 2. Send the Batch to Colab
+        if batch_files:
             try:
+                # START THE TIMER
+                req_start_time = time.time() 
+                
                 response = requests.post(
                     COLAB_API_URL, 
-                    files={"image": ("frame.jpg", buffer.tobytes(), "image/jpeg")},
-                    data={"camera_name": cam_name},
-                    timeout=5 # Prevents hanging if the connection drops
+                    files=batch_files,
+                    data=batch_names,
+                    timeout=8 
                 )
                 
+                # STOP THE TIMER
+                req_end_time = time.time()
+                
+                # CALCULATE TOTAL LAG
+                total_lag = req_end_time - req_start_time
+                
                 if response.status_code == 200:
-                    result = response.json()
-                    
-                    if result.get("status") == "success":
-                        pred = result['prediction']
-                        conf = result['confidence']
-                        caption = result['caption']
+                    data = response.json()
+                    if data.get("status") == "success":
+    
+                        # Print the lag to your terminal
+                        print(f"⏱️ Total Lag: {total_lag:.3f} seconds")
                         
-                        # Local Alert Logic
-                        if conf >= conf_threshold and pred not in ["Normal_Videos_event", "info"]:
-                            alert_key = f"{cam_name}_{pred}"
-                            curr_time = time.time()
+                        # Inside your successful response check:
+                        server_compute_time = data.get("compute_time_seconds", 0)
+                        network_lag = total_lag - server_compute_time
+                        
+                        print(f"⏱️ LAG BREAKDOWN | Total: {total_lag:.2f}s | AI Compute: {server_compute_time:.2f}s | Network: {network_lag:.2f}s")
+                        
+                        # Process all results returned in the batch
+                        for res in data["results"]:
+                            cam = res["camera"]
+                            pred = res["prediction"]
+                            conf = res["confidence"]
                             
-                            # 15-second cooldown per threat type per camera
-                            if curr_time - last_alert_time.get(alert_key, 0) > 15:
-                                last_alert_time[alert_key] = curr_time
-                                msg = f"Threat: {pred} ({conf:.2f})\nContext: {caption}"
-                                print(f"🚨 TRIGGERED: {msg}")
-                                send_telegram_alert(msg, location=cam_name)
-                        else:
-                            print(f"[{cam_name}] Clear: {pred} ({conf:.2f})")
+                            if conf >= CONF_THRESHOLD and pred not in ["Normal_Videos_event", "info"]:
+                                print(f"🚨 [ALERT] {cam}: {pred} ({conf:.2f})")
+                            else:
+                                print(f"✅ {cam}: Clear")
                 else:
-                    print(f"⚠️ Server returned error: {response.status_code}")
+                    print(f"⚠️ Server Error: {response.status_code} - {response.text}")
 
             except requests.exceptions.RequestException as e:
-                print(f"⚠️ Network error connecting to Colab for {cam_name}: {e}")
+                print(f"⚠️ Network error: {e}")
 
-            # Wait 1ms to allow cv2 to draw the window, and check for quit command
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                raise KeyboardInterrupt
-                
-        # Brief pause between full camera cycles to prevent overloading the free Ngrok tunnel
-        time.sleep(0.5) 
+        # 3. Check for Quit
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            raise KeyboardInterrupt
+
+        # 4. FPS Control Logic
+        elapsed_time = time.time() - loop_start_time
+        sleep_time = max(0.0, FRAME_DELAY - elapsed_time)
+        time.sleep(sleep_time)
 
 except KeyboardInterrupt:
     print("\nShutting down cameras...")
