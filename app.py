@@ -4,71 +4,66 @@ import requests
 from concurrent.futures import ThreadPoolExecutor
 
 # ==========================================
-# CONFIGURATION
+# 1. CONFIGURATION
 # ==========================================
-COLAB_API_URL = "https://detection-vertebrae-punctual.ngrok-free.dev/analyze_batch"
-TARGET_FPS = 5.0  
-FRAME_DELAY = 1.0 / TARGET_FPS  # 0.1 seconds per frame
+COLAB_API_URL = "https://secrecy-baffle-enlarging.ngrok-free.dev/analyze_batch"
+TARGET_FPS = 10.0  
+FRAME_DELAY = 1.0 / TARGET_FPS
 CONF_THRESHOLD = 0.50
 
-# Set up a pool of background workers to handle network requests
-# We limit to 3 workers so we don't accidentally DDoS our own Colab server!
-executor = ThreadPoolExecutor(max_workers=7) 
+# ⚠️ NEW: Motion Detection Settings
+# How many pixels need to change to trigger a send? 
+# (Increase this if bugs or tiny movements are triggering false alarms)
+MIN_MOTION_AREA = 5000 
+
+executor = ThreadPoolExecutor(max_workers=3) 
 
 # ==========================================
-# INITIALIZE CAMERAS
+# 2. INITIALIZE CAMERAS & MOTION SENSORS
 # ==========================================
-camera_sources = {
-    "Built-in": 0, 
-    # "USB_Left": 1, 
-    # "USB_Right": 2
-}
+camera_sources = {"Built-in": 0, "USB_Left": 1, "USB_Right": 2}
 cameras = {name: cv2.VideoCapture(src) for name, src in camera_sources.items() if cv2.VideoCapture(src).isOpened()}
 
 if not cameras:
     print("❌ No cameras found.")
     exit()
 
+# Create a dedicated "brain" for each camera to learn its specific background
+motion_detectors = {
+    name: cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=50, detectShadows=False) 
+    for name in cameras.keys()
+}
+
 # ==========================================
-# BACKGROUND UPLOAD FUNCTION
+# 3. BACKGROUND UPLOAD FUNCTION
 # ==========================================
 def send_batch_to_server(batch_files, batch_names, send_time):
-    """This function runs in the background so the camera doesn't freeze!"""
     try:
         response = requests.post(COLAB_API_URL, files=batch_files, data=batch_names, timeout=5)
-        
-        # ⏱️ Get the exact HTTP response time
         response_time = response.elapsed.total_seconds()
         
         if response.status_code == 200:
             data = response.json()
-            
-            # Extract the GPU compute time we set up earlier (if you still have it in your Colab code)
             gpu_time = data.get("compute_time_seconds", 0)
-            network_time = response_time - gpu_time
             
             if data.get("status") == "success":
                 for res in data["results"]:
-                    cam = res["camera"]
-                    pred = res["prediction"]
-                    conf = res["confidence"]
+                    cam, pred, conf = res["camera"], res["prediction"], res["confidence"]
                     
                     if conf >= CONF_THRESHOLD and pred not in ["Normal_Videos_event", "info"]:
-                        print(f"🚨 [SENT @ {send_time:.1f}s] {cam}: {pred} ({conf:.2f})")
-                    
-                # Optional: Print the health of the thread
-                print(f"📡 [Thread Health] Total Response: {response_time:.2f}s | Server AI: {gpu_time:.2f}s | Network: {network_time:.2f}s")
-            
+                        print(f"🚨 [THREAT] {cam}: {pred} ({conf:.2f})")
+                    else:
+                        print(f"✅ [CLEAR] {cam}: {pred}")
+                        
         else:
             print(f"⚠️ Server Error: {response.status_code}")
-    except requests.exceptions.RequestException as e:
-        # Silently drop frames if network is too slow, to prevent crashing
-        print(f"⚠️ Network timeout/error in background thread: {e}")
+    except requests.exceptions.RequestException:
+        pass # Drop the frame silently if network chokes
 
 # ==========================================
-# MAIN CAMERA LOOP (Strict FPS)
+# 4. MAIN LOOP (Motion-Activated)
 # ==========================================
-print(f"\n📡 Transmitting batches at {TARGET_FPS} FPS using Background Threads...")
+print(f"\n📡 System Armed. Waiting for motion...")
 try:
     while True:
         loop_start_time = time.time()
@@ -76,28 +71,50 @@ try:
         batch_files = []
         batch_names = []
         
-        # 1. Grab frames instantly
         for cam_name, cap in cameras.items():
             ret, frame = cap.read()
             if not ret: continue
 
+            # --- MOTION DETECTION LOGIC ---
+            # 1. Apply the subtractor to find moving pixels (creates a black & white mask)
+            fg_mask = motion_detectors[cam_name].apply(frame)
+            
+            # 2. Clean up the noise (remove tiny white specks)
+            _, fg_mask = cv2.threshold(fg_mask, 254, 255, cv2.THRESH_BINARY)
+            
+            # 3. Find the outlines of the moving objects
+            contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            motion_detected = False
+            for contour in contours:
+                # 4. If a moving object is bigger than our minimum area, trigger it!
+                if cv2.contourArea(contour) > MIN_MOTION_AREA:
+                    motion_detected = True
+                    
+                    # Optional: Draw a green box around the motion on your local screen
+                    x, y, w, h = cv2.boundingRect(contour)
+                    cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
+                    break # We only need one big movement to trigger the send
+
+            # Display the camera feed locally (now with green motion boxes!)
             cv2.imshow(cam_name, frame)
             
-            # Compress heavily (Quality 50) since 10 FPS is a lot of data!
-            _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-            batch_files.append(('images', (f"{cam_name}.jpg", buffer.tobytes(), 'image/jpeg')))
-            batch_names.append(('camera_names', cam_name))
+            # --- ONLY UPLOAD IF MOTION IS DETECTED ---
+            if motion_detected:
+                _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
+                batch_files.append(('images', (f"{cam_name}.jpg", buffer.tobytes(), 'image/jpeg')))
+                batch_names.append(('camera_names', cam_name))
 
-        # 2. Hand off the heavy lifting to a background thread
+        # Hand off to the background thread (Will only send the cameras that saw motion!)
         if batch_files:
+            # Notice we aren't printing every second anymore, just when motion fires
+            print(f"🏃 Motion detected in {[n[1] for n in batch_names]}! Uploading...") 
             executor.submit(send_batch_to_server, batch_files, batch_names, loop_start_time)
 
-        # 3. Quit Check
         if cv2.waitKey(1) & 0xFF == ord('q'):
             raise KeyboardInterrupt
 
-        # 4. Strict FPS Math
-        # Calculate exactly how long the capturing took, and sleep for the remainder
+        # FPS Math
         elapsed_time = time.time() - loop_start_time
         sleep_time = max(0.0, FRAME_DELAY - elapsed_time)
         time.sleep(sleep_time)
@@ -105,6 +122,6 @@ try:
 except KeyboardInterrupt:
     print("\nShutting down...")
 finally:
-    executor.shutdown(wait=False) # Kill background threads
+    executor.shutdown(wait=False)
     for cap in cameras.values(): cap.release()
     cv2.destroyAllWindows()
