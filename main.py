@@ -116,6 +116,10 @@ def run_surveillance():
             for cam_name, cap in cameras.items():
                 ret, frame = cap.read()
                 if not ret: continue
+                
+                # # ⚠️ ADD THESE TWO LINES FOR DEBUGGING
+                # cv2.imshow(f"Local Mirror: {cam_name}", frame)
+                # cv2.waitKey(1)
 
                 live_frame_buffer[cam_name] = frame.copy()
 
@@ -139,7 +143,16 @@ def run_surveillance():
     finally:
         for cap in cameras.values(): cap.release()
 
+# if __name__ == "__main__":
+#     server_thread = threading.Thread(target=start_local_server, daemon=True)
+#     server_thread.start()
+#     run_surveillance()
+
 if __name__ == "__main__":
-    server_thread = threading.Thread(target=start_local_server, daemon=True)
-    server_thread.start()
-    run_surveillance()
+    # 1. Start the Hardware Camera Loop in a background thread
+    hardware_thread = threading.Thread(target=run_surveillance, daemon=True)
+    hardware_thread.start()
+    
+    # 2. Start the Local Streaming Web Server on the MAIN thread
+    # (This makes Uvicorn happy and allows the video to flow out!)
+    start_local_server()
