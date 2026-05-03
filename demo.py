@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ==========================================
 # 1. FLEET CONFIGURATION (⚠️ UPDATE THESE!)
 # ==========================================
-NODE_NAME = "Command_Center" # Name of this specific laptop/device
+NODE_NAME = "Command_Center_2" # Name of this specific laptop/device
 COLAB_API_URL = "https://secrecy-baffle-enlarging.ngrok-free.dev" # Paste your Colab Registry URL here
 
 # Optimization configs
@@ -97,16 +97,22 @@ def tunnel_manager(active_cams):
 # 3. LOCAL VIDEO STREAMING
 # ==========================================
 def generate_video_stream(cam_name):
-    while True:
-        frame = live_frame_buffer.get(cam_name)
-        if frame is None:
-            time.sleep(0.1)
-            continue
+    try:
+        while True:
+            frame = live_frame_buffer.get(cam_name)
+            if frame is None:
+                time.sleep(0.1)
+                continue
+                
+            small_frame = cv2.resize(frame, (320, 240))
+            _, buffer = cv2.imencode('.jpg', small_frame, [cv2.IMWRITE_JPEG_QUALITY, 40])
             
-        small_frame = cv2.resize(frame, (320, 240))
-        _, buffer = cv2.imencode('.jpg', small_frame, [cv2.IMWRITE_JPEG_QUALITY, 40])
-        yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
-        time.sleep(0.33)
+            yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+            time.sleep(0.33)
+    except GeneratorExit:
+        # This triggers immediately when the client/tunnel disconnects.
+        # It cleanly exits the loop instead of freezing the thread!
+        print(f"🚪 Stream closed for {cam_name}")
 
 @app.get("/stream/{cam_name}")
 def video_feed(cam_name: str):
@@ -146,7 +152,11 @@ def run_surveillance():
     for name in active_cams: live_frame_buffer[name] = None
     motion_detectors = {name: cv2.createBackgroundSubtractorMOG2(history=500, varThreshold=50, detectShadows=False) for name in active_cams}
     
-    # ⚠️ START AUTONOMOUS REGISTRATION ONCE HARDWARE IS READY
+    # ⏱️ NEW: Track the last time a frame was sent for each camera
+    last_frame_sent = {name: time.time() for name in active_cams}
+    FORCE_SEND_INTERVAL = 10.0  # Force send a frame to Colab every 10 seconds
+
+    # START AUTONOMOUS REGISTRATION
     tunnel_thread = threading.Thread(target=tunnel_manager, args=(active_cams,), daemon=True)
     tunnel_thread.start()
 
@@ -165,12 +175,19 @@ def run_surveillance():
                 _, fg_mask = cv2.threshold(fg_mask, 254, 255, cv2.THRESH_BINARY)
                 contours, _ = cv2.findContours(fg_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
                 
-                if any(cv2.contourArea(c) > MIN_MOTION_AREA for c in contours):
+                # Check motion OR if the forced time interval has passed
+                motion_detected = any(cv2.contourArea(c) > MIN_MOTION_AREA for c in contours)
+                time_since_last_send = time.time() - last_frame_sent[cam_name]
+
+                if motion_detected or time_since_last_send >= FORCE_SEND_INTERVAL:
                     _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 50])
-                    # Send the FULL name (e.g. Command_Center_Built-in) to Colab
                     full_cam_id = f"{NODE_NAME}_{cam_name}"
+                    
                     batch_files.append(('images', (f"{cam_name}.jpg", buffer.tobytes(), 'image/jpeg')))
                     batch_names.append(('camera_names', full_cam_id))
+                    
+                    # Reset the timer for this camera
+                    last_frame_sent[cam_name] = time.time()
 
             if batch_files:
                 executor.submit(send_batch_to_colab, batch_files, batch_names)
